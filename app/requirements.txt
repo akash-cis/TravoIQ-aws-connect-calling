@@ -1,0 +1,26 @@
+# FastAPI and web framework dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+jinja2==3.1.2
+python-multipart==0.0.6
+python-dotenv==1.0.0
+
+# AWS SDK and services
+boto3
+botocore
+aiobotocore
+
+# WebSocket support
+websockets==12.0
+
+# Audio processing and MKV parsing
+ebmlite==3.2.0
+numpy==1.24.3
+pydub==0.25.1
+
+# Optional: For enhanced audio processing (if needed)
+# ffmpeg-python==0.2.0
+
+# Additional utilities
+asyncio-mqtt==0.16.1
+aiofiles==23.2.1

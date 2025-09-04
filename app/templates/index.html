@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Call Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2em; background-color: #f4f7f6; color: #333; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 2em; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #333; }
+        .controls { display: flex; gap: 10px; margin-bottom: 2em; }
+        .controls input { flex-grow: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 1rem; }
+        .controls button { padding: 10px 20px; border: none; background-color: #007bff; color: white; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+        .controls button:hover { background-color: #0056b3; }
+        #status { font-style: italic; color: #555; text-align: center; margin-bottom: 1em; }
+        .details-box { background: #eef7ff; padding: 1.5em; border-radius: 4px; margin-bottom: 2em; border-left: 5px solid #007bff; }
+        .details-box h2 { margin-top: 0; color: #0056b3; }
+        #transcript-box { border: 1px solid #ddd; padding: 1em; height: 400px; overflow-y: auto; background: #fff; border-radius: 4px; display: flex; flex-direction: column; gap: 0.5em;}
+        .segment { padding: 0.6em 1em; border-radius: 18px; max-width: 75%; line-height: 1.4; }
+        .segment strong { font-weight: 600; }
+        .customer { background-color: #dcf8c6; align-self: flex-start; border-bottom-left-radius: 4px; }
+        .agent { background-color: #f1f0f0; align-self: flex-end; border-bottom-right-radius: 4px; }
+
+        /* --- NEW: Loader CSS --- */
+        .loader {
+            border: 5px solid #f3f3f3; /* Light grey */
+            border-top: 5px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 2em auto; /* Center the loader */
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* ----------------------- */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Live Call Dashboard</h1>
+        <div class="controls">
+            <input type="text" id="callIdInput" placeholder="Waiting for new call...">
+            <button onclick="connect()">Start Monitoring</button>
+        </div>
+        <p id="status">Status: Disconnected</p>
+
+        <!-- NEW: Loader HTML Element (hidden by default) -->
+        <div id="loader" class="loader" style="display:none;"></div>
+
+        <div class="details-box" id="detailsBox" style="display:none;">
+            <h2>Call Details</h2>
+            <p id="callDetails"></p>
+        </div>
+
+        <div id="transcript-box" style="display:none;"></div>
+    </div>
+
+    <script>
+        let fastapiSocket;
+        let currentlyMonitoredId = null;
+        const statusDiv = document.getElementById('status');
+        const callIdInput = document.getElementById('callIdInput');
+        const detailsBox = document.getElementById('detailsBox');
+        const callDetailsP = document.getElementById('callDetails');
+        const transcriptBox = document.getElementById('transcript-box');
+        const loader = document.getElementById('loader'); // Get the loader element
+
+        async function pollForLatestCall() {
+            try {
+                const response = await fetch('/latest-call');
+                if (response.ok) {
+                    const data = await response.json();
+                    const latestCallId = data.contactId;
+
+                    if (latestCallId && latestCallId !== currentlyMonitoredId) {
+                        statusDiv.textContent = `Status: New call detected! Switching...`;
+                        callIdInput.value = latestCallId;
+                        connect(); 
+                    }
+                }
+            } catch (error) {
+                console.log("Polling: No recent calls found or server error.");
+            }
+        }
+
+        async function connect() {
+            if (fastapiSocket) fastapiSocket.close();
+            
+            const callId = callIdInput.value.trim();
+            if (!callId) return;
+
+            // --- UI UPDATE: Clear old data and show loader ---
+            currentlyMonitoredId = callId;
+            transcriptBox.innerHTML = "";
+            transcriptBox.style.display = 'none'; // Hide transcript box
+            detailsBox.style.display = 'none';   // Hide details box
+            loader.style.display = 'block';      // Show loader
+            // ------------------------------------------------
+
+            try {
+                // Fetch Call Details
+                const response = await fetch(`/details/${callId}`);
+                if (!response.ok) throw new Error(`Failed to fetch details for ${callId}`);
+                const details = await response.json();
+                
+                callDetailsP.innerHTML = `
+                    <strong>Contact ID:</strong> ${details.contactId}<br>
+                    <strong>Phone Number:</strong> ${details.customerPhoneNumber}<br>
+                    <strong>Call Timestamp:</strong> ${new Date(details.callTimestamp).toLocaleString()}
+                `;
+                // Show the details box now that it has content
+                detailsBox.style.display = 'block';
+
+                // Connect WebSocket
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${wsProtocol}//${window.location.host}/ws/${callId}`;
+                fastapiSocket = new WebSocket(wsUrl);
+
+                fastapiSocket.onopen = () => {
+                    statusDiv.textContent = `Status: Monitoring live transcript for ${callId}`;
+                    // Show the transcript box now that the connection is open
+                    transcriptBox.style.display = 'flex';
+                };
+
+                fastapiSocket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    const segmentDiv = document.createElement('div');
+                    segmentDiv.classList.add('segment', data.speaker.toLowerCase());
+                    segmentDiv.innerHTML = `<strong>${data.speaker}:</strong> ${data.text}`;
+                    transcriptBox.appendChild(segmentDiv);
+                    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+                };
+
+                fastapiSocket.onclose = () => {
+                    statusDiv.textContent = `Status: Monitoring stopped for ${currentlyMonitoredId}. Listening for new calls...`;
+                    if (callId === currentlyMonitoredId) currentlyMonitoredId = null;
+                };
+
+            } catch (error) {
+                statusDiv.textContent = `Error: ${error.message}`;
+                currentlyMonitoredId = null;
+            } finally {
+                // --- UI UPDATE: Always hide loader when done ---
+                loader.style.display = 'none';
+            }
+        }
+
+        // Start polling as soon as the page loads
+        statusDiv.textContent = "Status: Listening for new calls...";
+        setInterval(pollForLatestCall, 500);
+    </script>
+</body>
+</html>
