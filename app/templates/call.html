@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Receive Call</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; }
+    header { background:#0b5cab; color:#fff; padding:12px 16px; }
+    main { padding:16px; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    #status { color:#334155; font-style:italic; margin-top:8px; }
+    button { background:#0b5cab; color:#fff; border:none; padding:10px 14px; border-radius:6px; cursor:pointer; }
+    button.secondary { background:#64748b; }
+
+    /* Incoming Call Modal */
+    .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center; z-index:1000; }
+    .modal { background:#fff; width: 420px; max-width:90vw; border-radius:10px; box-shadow:0 10px 25px rgba(0,0,0,0.2); overflow:hidden; }
+    .modal header { background:#0b5cab; color:#fff; padding:12px 16px; }
+    .modal .body { padding:16px; color:#334155; }
+    .modal .footer { display:flex; gap:10px; justify-content:flex-end; padding:12px 16px; background:#f8fafc; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; font-size:12px; }
+    /* Floating CCP dock (hidden until agent accepts) */
+    #ccpDock { position:fixed; bottom:16px; right:16px; width:420px; height:560px; background:#fff; border:1px solid #e5e7eb; border-radius:12px; box-shadow:0 12px 30px rgba(0,0,0,0.2); overflow:hidden; display:none; z-index:1200; }
+    #ccpDock .dock-header { height:44px; background:linear-gradient(90deg,#0b5cab,#0a67c2); color:#fff; display:flex; align-items:center; justify-content:space-between; padding:0 12px; }
+    #ccpDock .dock-title { font-weight:600; font-size:14px; }
+    #ccpDock .dock-actions button { background:transparent; color:#fff; border:none; font-size:18px; cursor:pointer; line-height:1; }
+    #ccpContainer { width:100%; height:calc(100% - 44px); }
+    #ccpBadge { position:fixed; bottom:16px; right:16px; width:48px; height:48px; border-radius:999px; background:linear-gradient(180deg,#0b5cab,#0a67c2); color:#fff; display:none; align-items:center; justify-content:center; font-weight:600; box-shadow:0 10px 24px rgba(0,0,0,0.25); cursor:pointer; z-index:1199; }
+    #liveCall { display:none; margin-top:16px; }
+
+    /* Transcript styling (from index.html) */
+    #transcript-box { border: 1px solid #ddd; padding: 1em; height: 300px; overflow-y: auto; background: #fff; border-radius: 4px; display: none; flex-direction: column; gap: 0.5em; }
+    .segment { padding: 0.6em 1em; border-radius: 18px; max-width: 75%; line-height: 1.4; }
+    .segment strong { font-weight: 600; }
+    .customer { background-color: #dcf8c6; align-self: flex-start; border-bottom-left-radius: 4px; }
+    .agent { background-color: #f1f0f0; align-self: flex-end; border-bottom-right-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2>Receive Calls</h2>
+  </header>
+  <main>
+    <div class="card">
+      <div class="row">
+        <button id="connectBtn">Connect to Incoming Calls</button>
+        <button id="disconnectBtn" class="secondary">Disconnect</button>
+      </div>
+      <div id="status">Disconnected</div>
+    </div>
+
+    <div id="ccpDock">
+      <div class="dock-header">
+        <div class="dock-title">AWS Connect</div>
+        <div class="dock-actions">
+          <button id="ccpMinBtn" title="Minimize">–</button>
+        </div>
+      </div>
+      <div id="ccpContainer"></div>
+    </div>
+
+    <div id="liveCall" class="card">
+      <h3>Live Call</h3>
+      <div>Contact ID: <span id="liveContactId">-</span></div>
+      <div>From: <span id="liveFrom">-</span></div>
+      <div>Duration: <span id="liveTimer">00:00</span></div>
+    </div>
+
+    <div id="transcription" class="card" style="display:none;">
+      <h3>Transcription</h3>
+      <div id="transcript-box"></div>
+    </div>
+  </main>
+
+  <div id="ccpBadge" title="Open CCP">CCP</div>
+
+  <!-- Robust loader for Amazon Connect Streams with multiple fallbacks and optional local static copy -->
+  <script>
+    (function loadStreams(){
+      var tried = {};
+      var sources = [
+        'https://connect-cdn.amazon.com/connect-streams.js',
+        'https://unpkg.com/amazon-connect-streams@1.7.5/amazon-connect-streams-min.js',
+        'https://cdn.jsdelivr.net/npm/amazon-connect-streams@1.7.5/amazon-connect-streams-min.js',
+        '/static/connect-streams.js',
+        '/static/connect-streams-min.js',
+        '/static/amazon-connect-streams-min.js'
+      ];
+      function next(){
+        if(!sources.length) return;
+        var src = sources.shift();
+        if(tried[src]) return next();
+        tried[src] = true;
+        var s = document.createElement('script');
+        s.src = src; s.async = true;
+        s.onload = function(){ console.log('Loaded Streams from', src); };
+        s.onerror = function(){ console.warn('Failed to load Streams from', src); next(); };
+        document.head.appendChild(s);
+      }
+      next();
+    })();
+  </script>
+
+  <script>
+    let ws;
+    const statusEl = document.getElementById('status');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const transcriptBox = document.getElementById('transcript-box');
+    const transcriptionCard = document.getElementById('transcription');
+
+    // Incoming Call Modal elements
+    const modalBackdrop = document.createElement('div');
+    modalBackdrop.className = 'modal-backdrop';
+    modalBackdrop.innerHTML = `
+      <div class="modal">
+        <header>
+          <strong>Incoming Call</strong>
+        </header>
+        <div class="body">
+          <div id="modalCallInfo">
+            <div><span class="pill">Ringing</span></div>
+            <div style=\"margin-top:8px; font-size:14px;\">
+              <div><strong>From:</strong> <span id=\"modalFrom\">Unknown</span></div>
+              <div><strong>ContactId:</strong> <span id=\"modalContactId\">-</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="footer">
+          <button id="btnDecline" class="secondary">Decline</button>
+          <button id="btnAccept">Accept</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modalBackdrop);
+    const btnAccept = modalBackdrop.querySelector('#btnAccept');
+    const btnDecline = modalBackdrop.querySelector('#btnDecline');
+    const modalFrom = modalBackdrop.querySelector('#modalFrom');
+    const modalContactId = modalBackdrop.querySelector('#modalContactId');
+
+    let currentInboundContact = null;
+    let lastIncomingSignal = null; // from our /ws/incoming-calls feed
+    let pendingAccept = false;
+    let pendingDecline = false;
+    let currentContactId = null;
+    let transcriptSocket = null;
+
+    function showIncomingModal(from, contactId) {
+      modalFrom.textContent = from || 'Unknown';
+      modalContactId.textContent = contactId || '-';
+      modalBackdrop.style.display = 'flex';
+    }
+    function hideIncomingModal() {
+      modalBackdrop.style.display = 'none';
+    }
+
+    // Live call timer
+    let timerInterval = null; let startTs = null;
+    function startTimer(){
+      if(timerInterval) clearInterval(timerInterval);
+      startTs = Date.now();
+      timerInterval = setInterval(()=>{
+        const sec = Math.floor((Date.now()-startTs)/1000);
+        const mm = String(Math.floor(sec/60)).padStart(2,'0');
+        const ss = String(sec%60).padStart(2,'0');
+        document.getElementById('liveTimer').textContent = mm+':'+ss;
+      }, 1000);
+    }
+    function stopTimer(){ if(timerInterval) clearInterval(timerInterval); timerInterval=null; document.getElementById('liveTimer').textContent='00:00'; }
+
+    // Transcript websocket lifecycle
+    function startTranscript(callId){
+      try { if (transcriptSocket) { transcriptSocket.close(); transcriptSocket = null; } } catch(e){}
+      if (!callId) return;
+      transcriptBox.innerHTML = '';
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws/${callId}`;
+      try {
+        transcriptSocket = new WebSocket(wsUrl);
+        transcriptSocket.onopen = () => { transcriptBox.style.display = 'flex'; };
+        transcriptSocket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            const seg = document.createElement('div');
+            seg.classList.add('segment', (data.speaker || 'Agent').toLowerCase());
+            seg.innerHTML = `<strong>${data.speaker}:</strong> ${data.text || ''}`;
+            transcriptBox.appendChild(seg);
+            transcriptBox.scrollTop = transcriptBox.scrollHeight;
+          } catch(e){}
+        };
+        transcriptSocket.onerror = () => {};
+        transcriptSocket.onclose = () => {};
+      } catch(e){}
+    }
+    function stopTranscript(){
+      try { if (transcriptSocket) transcriptSocket.close(); } catch(e){}
+      transcriptSocket = null;
+      transcriptBox.style.display = 'none';
+      transcriptionCard.style.display = 'none';
+    }
+
+    // Helper: set agent status back to Available/Routable after call ends
+    function setAgentRoutable(){
+      try {
+        if (!window.connect) return;
+        connect.agent(function(agent){
+          try {
+            const list = (agent.getAgentStates && agent.getAgentStates()) || (agent.getAgentStatuses && agent.getAgentStatuses()) || [];
+            let target = null;
+            for (var i=0;i<list.length;i++){
+              const it = list[i];
+              const type = (it.type || it.stateType || '').toString().toLowerCase();
+              const name = (it.name || '').toString().toLowerCase();
+              if (type === 'routable' || name === 'available'){ target = it; break; }
+            }
+            if (target){
+              if (typeof agent.setState === 'function') agent.setState(target, { onSuccess:()=>console.log('Agent routable'), onFailure:e=>console.warn('setState failed', e) });
+              else if (typeof agent.setStatus === 'function') agent.setStatus(target, { onSuccess:()=>console.log('Agent routable'), onFailure:e=>console.warn('setStatus failed', e) });
+            }
+          } catch(e){}
+        });
+      } catch(e){}
+    }
+
+    // Helper: stop contact via backend API as a fallback
+    function endContactViaAPI(contactId){
+      try {
+        if (!contactId) return;
+        fetch(`/api/calls/${encodeURIComponent(contactId)}/end`, { method:'POST' }).catch(()=>{});
+      } catch(e){}
+    }
+
+    connectBtn.onclick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws/incoming-calls`);
+      ws.onopen = () => { statusEl.textContent = 'Connected. Waiting for incoming calls...'; };
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'incoming_call') {
+            const data = msg.data || {};
+            lastIncomingSignal = data;
+            statusEl.textContent = `Incoming call: ${data.phoneNumber || ''} (ContactId: ${data.contactId})`;
+            // Show early popup even before Streams contact object arrives
+            showIncomingModal(data.phoneNumber || '', data.contactId || '');
+            // Also surface a visible badge so the agent can open the dock manually if needed
+            document.getElementById('ccpBadge').style.display = 'flex';
+          }
+        } catch (e) {}
+      };
+      ws.onclose = () => { statusEl.textContent = 'Disconnected'; };
+      ws.onerror = () => { statusEl.textContent = 'Socket error'; };
+    };
+
+    disconnectBtn.onclick = () => { if (ws) ws.close(); };
+
+    // Auto-connect to incoming calls WebSocket on page load
+    (function autoConnectWS(){
+      try { connectBtn.onclick(); } catch(e) {}
+    })();
+
+    // Initialize CCP via Streams API (wait a tick for script)
+    (function initCCP(){
+      const ccpUrl = '{{ ccpUrl }}';
+      if (!ccpUrl || ccpUrl === 'about:blank') { return; }
+      const init = function(){
+        if (!window.connect || !window.connect.core) { return setTimeout(init, 300); }
+        connect.core.initCCP(document.getElementById('ccpContainer'), {
+          ccpUrl: ccpUrl,
+          loginPopup: false,
+          softphone: { allowFramedSoftphone: true },
+          region: '{{ region }}'
+        });
+
+        connect.contact(function(contact){
+          try {
+            const status = contact.getStatus().type;
+            const id = contact.getContactId();
+            const isInbound = (contact.isInbound && contact.isInbound()) ? true : false;
+            const attr = (contact.getAttributes && contact.getAttributes()) || {};
+            const fromNum = (attr && attr.customerPhoneNumber && attr.customerPhoneNumber.value) || (lastIncomingSignal && lastIncomingSignal.phoneNumber) || '';
+
+            statusEl.textContent = 'Contact state: ' + status;
+            console.log('Streams contact event', { status, id, isInbound, attr });
+
+            // If inbound and ringing, show modal (or auto-accept/decline if pending)
+            const showStatuses = ['incoming','connecting','routing','queued','queue','pending','contactIncoming','alerting'];
+            if (isInbound && showStatuses.indexOf((status||'').toLowerCase()) !== -1) {
+              currentInboundContact = contact;
+              if (pendingAccept && typeof contact.accept === 'function') { contact.accept(); pendingAccept = false; hideIncomingModal(); }
+              else if (pendingDecline) {
+                if (typeof contact.reject === 'function') contact.reject();
+                else if (typeof contact.destroy === 'function') contact.destroy();
+                pendingDecline = false; hideIncomingModal();
+              } else {
+                showIncomingModal(fromNum, id);
+              }
+            }
+
+            contact.onConnecting(()=> {
+              statusEl.textContent = 'Connecting...';
+              hideIncomingModal();
+              document.getElementById('ccpDock').style.display = 'block';
+              document.getElementById('ccpBadge').style.display = 'none';
+              document.getElementById('liveCall').style.display = 'block';
+              transcriptionCard.style.display = 'block';
+              document.getElementById('liveContactId').textContent = id;
+              document.getElementById('liveFrom').textContent = fromNum || '-';
+              currentContactId = id;
+              startTranscript(id);
+            });
+            contact.onConnected(()=> {
+              statusEl.textContent = 'Connected';
+              startTimer();
+            });
+            contact.onEnded(()=> {
+              statusEl.textContent = 'Ended';
+              hideIncomingModal(); currentInboundContact = null; stopTimer();
+              document.getElementById('ccpDock').style.display = 'none';
+              document.getElementById('ccpBadge').style.display = 'none';
+              document.getElementById('liveCall').style.display = 'none';
+              stopTranscript();
+              setAgentRoutable();
+              // Defensive: ensure backend stop in case Streams missed cleanup
+              endContactViaAPI(currentContactId);
+              currentContactId = null;
+              connect.disconnect();
+            });
+          } catch (e) { /* ignore */ }
+        });
+
+        connect.agent(function(agent){
+          statusEl.textContent = 'Agent ready: ' + agent.getName();
+        });
+      };
+      init();
+    })();
+
+    // Accept/Decline actions using Streams contact API
+    btnAccept.onclick = function(){
+      if (currentInboundContact && typeof currentInboundContact.accept === 'function') {
+        try { currentInboundContact.accept(); } catch (e) {}
+        hideIncomingModal();
+        document.getElementById('ccpDock').style.display = 'block';
+        document.getElementById('ccpBadge').style.display = 'none';
+      } else {
+        pendingAccept = true;
+        document.getElementById('ccpDock').style.display = 'block';
+        document.getElementById('ccpDock').scrollIntoView({ behavior: 'smooth' });
+        document.getElementById('ccpBadge').style.display = 'none';
+      }
+    };
+    // Badge click toggles dock
+    document.getElementById('ccpBadge').onclick = function(){
+      var dock = document.getElementById('ccpDock');
+      dock.style.display = (dock.style.display === 'none' || !dock.style.display) ? 'block' : 'none';
+    };
+    // Minimize button returns dock to badge
+    document.getElementById('ccpMinBtn').onclick = function(){
+      document.getElementById('ccpDock').style.display = 'none';
+      document.getElementById('ccpBadge').style.display = 'flex';
+    };
+    btnDecline.onclick = function(){
+      if (currentInboundContact) {
+        try {
+          if (typeof currentInboundContact.reject === 'function') currentInboundContact.reject();
+          else if (typeof currentInboundContact.destroy === 'function') currentInboundContact.destroy();
+        } catch (e) {}
+        hideIncomingModal();
+      } else {
+        pendingDecline = true;
+      }
+    };
+  </script>
+</body>
+</html>
+
+

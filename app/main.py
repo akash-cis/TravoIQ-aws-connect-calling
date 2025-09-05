@@ -5,6 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from jinja2 import TemplateNotFound, ChoiceLoader, FileSystemLoader
 from boto3.dynamodb.conditions import Key
 from decimal import Decimal
@@ -12,7 +13,7 @@ import json
 import os
 import logging
 import traceback
-from typing import Optional
+from typing import Optional, Dict
 from datetime import datetime, timezone
 from pydantic import BaseModel
 
@@ -95,12 +96,119 @@ app.add_middleware(
 templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(__file__), "templates")
 )
-logger.info(f"Using templates directory: {templates.directory}")
+logger.info(
+    f"Using templates directory: {os.path.join(os.path.dirname(__file__), 'templates')}"
+)
+
+# Mount static for optional self-hosted assets (e.g., amazon-connect-streams)
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+else:
+    logger.info(f"Static directory not found, skipping mount: {_static_dir}")
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 
 details_table = dynamodb.Table(DETAILS_TABLE_NAME)
 customer_table = dynamodb.Table(CUSTOMER_TRANSCRIPT_TABLE_NAME)
 agent_table = dynamodb.Table(AGENT_TRANSCRIPT_TABLE_NAME)
+
+# --- AWS Connect Clients and Call Manager ---
+CONNECT_REGION = AWS_REGION
+connect_client = boto3.client("connect", region_name=CONNECT_REGION)
+# connect_contact_client = boto3.client("connectcontactlens", region_name=CONNECT_REGION)
+
+
+class CallManager:
+    def __init__(self) -> None:
+        # These should be configured via env/SSM in real deployments
+        self.instance_id = os.getenv("CONNECT_INSTANCE_ID", "your-connect-instance-id")
+        flow_arn = os.getenv("CONNECT_CONTACT_FLOW_ARN")
+        flow_id_env = os.getenv("CONNECT_CONTACT_FLOW_ID")
+        if flow_arn and "/contact-flow/" in flow_arn:
+            self.contact_flow_id = flow_arn.split("/contact-flow/")[-1]
+        else:
+            self.contact_flow_id = flow_id_env or "your-contact-flow-id"
+
+        # Optional queue for outbound routing
+        self.queue_id = os.getenv("CONNECT_QUEUE_ID")
+
+        raw_source = os.getenv("CONNECT_SOURCE_PHONE", "your-connect-phone-number")
+        if raw_source.startswith("+"):
+            digits = "+" + "".join(ch for ch in raw_source if ch.isdigit())
+        else:
+            digits = "+" + "".join(ch for ch in raw_source if ch.isdigit())
+        self.source_phone_number = digits
+
+    async def initiate_outbound_call(self, agent_id: str, phone_number: str) -> str:
+        try:
+            params = {
+                "DestinationPhoneNumber": phone_number,
+                "ContactFlowId": self.contact_flow_id,
+                "InstanceId": self.instance_id,
+                "SourcePhoneNumber": self.source_phone_number,
+                "Attributes": {"agent_id": agent_id},
+            }
+            if self.queue_id:
+                params["QueueId"] = self.queue_id
+
+            response = connect_client.start_outbound_voice_contact(**params)
+            return response["ContactId"]
+        except Exception as e:
+            logger.error(f"initiate_outbound_call failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def get_agent_status(self, agent_id: str):
+        try:
+            response = connect_client.describe_user(
+                UserId=agent_id, InstanceId=self.instance_id
+            )
+            return response
+        except Exception as e:
+            logger.error(f"get_agent_status failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+call_manager = CallManager()
+
+# Active agent websocket connections
+active_agent_connections: Dict[str, WebSocket] = {}
+
+
+# --- Incoming Calls Broadcast Manager and API ---
+class IncomingCall(BaseModel):
+    contactId: str
+    phoneNumber: Optional[str] = None
+    customerName: Optional[str] = None
+    callTimestamp: Optional[str] = None  # ISO8601
+    metadata: Optional[dict] = None
+
+
+class IncomingCallsManager:
+    def __init__(self) -> None:
+        self.active_connections: list[WebSocket] = []
+
+    def connect(self, websocket: WebSocket) -> None:
+        if websocket not in self.active_connections:
+            self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            pass
+
+    async def broadcast(self, message: dict) -> None:
+        stale: list[WebSocket] = []
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self.disconnect(ws)
+
+
+incoming_calls_manager = IncomingCallsManager()
 
 # --- API Endpoints ---
 # (The / and /details endpoints are unchanged and correct)
@@ -122,6 +230,20 @@ async def read_root(request: Request):
         return JSONResponse(
             status_code=200, content={"status": "ok", "message": "UI not available"}
         )
+
+
+@app.get("/call", response_class=HTMLResponse)
+async def call_page(request: Request):
+    region = AWS_REGION
+    ccp_url_env = os.getenv("CONNECT_CCP_URL")
+    if ccp_url_env:
+        ccp_url = ccp_url_env
+    else:
+        alias = os.getenv("CONNECT_INSTANCE_ALIAS", "")
+        ccp_url = f"https://{alias}.my.connect.aws/ccp-v2/" if alias else "about:blank"
+    return templates.TemplateResponse(
+        "call.html", {"request": request, "ccpUrl": ccp_url, "region": region}
+    )
 
 
 @app.get("/details/{call_id}")
@@ -203,6 +325,36 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
         )
 
 
+@app.websocket("/ws/agent/{agent_id}")
+async def websocket_agent(websocket: WebSocket, agent_id: str):
+    await websocket.accept()
+    active_agent_connections[agent_id] = websocket
+    logger.info(f"Agent websocket connected: {agent_id}")
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+            except Exception:
+                continue
+            msg_type = message.get("type")
+            payload = message.get("data", {})
+
+            if msg_type == "call_status":
+                logger.info(f"Agent {agent_id} status update: {payload}")
+            elif msg_type == "webrtc_offer":
+                logger.info(f"Agent {agent_id} WebRTC offer received")
+            elif msg_type == "webrtc_answer":
+                logger.info(f"Agent {agent_id} WebRTC answer received")
+            else:
+                logger.info(f"Agent {agent_id} unknown message type: {msg_type}")
+            await asyncio.sleep(0)
+    except WebSocketDisconnect:
+        logger.info(f"Agent websocket disconnected: {agent_id}")
+    finally:
+        active_agent_connections.pop(agent_id, None)
+
+
 @app.get("/latest-call")
 async def get_latest_call():
     """Scans the details table to find the most recent call."""
@@ -231,3 +383,95 @@ async def get_latest_call():
     contact_id = latest_call.get("contactId")
     logger.info(f"Found latest call with ID: {contact_id}")
     return {"contactId": contact_id}
+
+
+# --- AWS Connect REST API Endpoints ---
+
+
+@app.post("/api/calls/start")
+async def start_call(call_data: dict):
+    """Start a new outbound call via AWS Connect."""
+    agent_id = call_data.get("agent_id")
+    phone_number = call_data.get("phone_number")
+    if not agent_id or not phone_number:
+        raise HTTPException(
+            status_code=400, detail="agent_id and phone_number are required"
+        )
+    # Accept either full ARN or bare ID for agent_id
+    if ":agent/" in agent_id:
+        agent_id = agent_id.split(":agent/")[-1]
+    contact_id = await call_manager.initiate_outbound_call(agent_id, phone_number)
+    return {"contact_id": contact_id, "status": "initiated"}
+
+
+@app.post("/api/calls/{contact_id}/end")
+async def end_call(contact_id: str):
+    """End an active Connect call."""
+    try:
+        connect_client.stop_contact(
+            ContactId=contact_id, InstanceId=call_manager.instance_id
+        )
+        return {"status": "call_ended"}
+    except Exception as e:
+        logger.error(f"stop_contact failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agent/{agent_id}/status")
+async def get_agent_status(agent_id: str):
+    if ":agent/" in agent_id:
+        agent_id = agent_id.split(":agent/")[-1]
+    return await call_manager.get_agent_status(agent_id)
+
+
+@app.post("/api/agent/{agent_id}/status")
+async def update_agent_status(agent_id: str, status_data: dict):
+    try:
+        if ":agent/" in agent_id:
+            agent_id = agent_id.split(":agent/")[-1]
+        connect_client.put_user_status(
+            UserId=agent_id,
+            InstanceId=call_manager.instance_id,
+            AgentStatusId=status_data.get("status_id"),
+        )
+        return {"status": "updated"}
+    except Exception as e:
+        logger.error(f"put_user_status failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Ingest a new incoming call and broadcast to listeners
+@app.post("/api/incoming-call")
+async def incoming_call(payload: IncomingCall):
+    timestamp = payload.callTimestamp or datetime.now(timezone.utc).isoformat()
+    item = {
+        "contactId": payload.contactId,
+        "callTimestamp": timestamp,
+        "phoneNumber": payload.phoneNumber,
+        "customerName": payload.customerName,
+        "metadata": payload.metadata or {},
+    }
+    try:
+        details_table.put_item(Item=item)
+        logger.info(f"Stored incoming call: {payload.contactId}")
+    except ClientError as e:
+        logger.error(f"Failed to store incoming call: {e}")
+        raise HTTPException(status_code=500, detail="Failed to persist incoming call")
+
+    await incoming_calls_manager.broadcast({"type": "incoming_call", "data": item})
+    return JSONResponse(
+        status_code=201, content={"status": "created", "contactId": payload.contactId}
+    )
+
+
+@app.websocket("/ws/incoming-calls")
+async def websocket_incoming_calls(websocket: WebSocket):
+    await websocket.accept()
+    incoming_calls_manager.connect(websocket)
+    logger.info("WebSocket connected for incoming calls stream")
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except WebSocketDisconnect:
+        incoming_calls_manager.disconnect(websocket)
+        logger.info("WebSocket disconnected for incoming calls stream")
